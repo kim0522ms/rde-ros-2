@@ -33,6 +33,7 @@ export class AttachResolver implements vscode.DebugConfigurationProvider {
     private readonly supportedRuntimeTypes = [
         "C++",
         "Python",
+        ".NET",
     ];
 
     public async resolveDebugConfigurationWithSubstitutedVariables(folder: vscode.WorkspaceFolder | undefined, config: requests.IAttachRequest, token?: vscode.CancellationToken): Promise<vscode.DebugConfiguration> {
@@ -153,6 +154,21 @@ export class AttachResolver implements vscode.DebugConfigurationProvider {
                 host: host,
             };
             debugConfig = pythonattachdebugconfiguration;
+        } else if (config.runtime === ".NET") {
+            if (!vscode_utils.isDotnetDebuggerExtensionInstalled()) {
+                const message = ".NET debugging requires the Microsoft C# extension (ms-dotnettools.csharp) or C# Dev Kit.";
+                vscode.window.showErrorMessage(message);
+                throw new Error(message);
+            }
+
+            const dotnetAttachConfig: any = {
+                name: `.NET: ${config.processId}`,
+                type: "coreclr",
+                request: "attach",
+                processId: config.processId,
+                justMyCode: false,
+            };
+            debugConfig = dotnetAttachConfig;
         }
 
         if (!debugConfig) {

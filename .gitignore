@@ -14,7 +14,7 @@ test-results/**
 
 vscode.d.ts
 
-vscode-ros-dev.vsix
+*.vsix
 
 **/.venv/**
 

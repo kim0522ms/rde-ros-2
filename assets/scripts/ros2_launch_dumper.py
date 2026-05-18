@@ -36,6 +36,7 @@ from launch.actions import IncludeLaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import LogInfo
 from launch.actions import OpaqueFunction
+from launch.actions import RegisterEventHandler
 
 # Optional imports for environment variable actions that may not exist in all versions
 try:
@@ -362,6 +363,20 @@ if __name__ == "__main__":
                 except Exception:
                     # Some actions may not support visit(), that's okay
                     pass
+                continue
+
+            if isinstance(entity, RegisterEventHandler):
+                try:
+                    event_handler = getattr(entity, 'event_handler', None)
+                    actions_on_event = getattr(event_handler, '_OnActionEventBase__actions_on_event', None)
+                    if actions_on_event:
+                        actions = list(actions_on_event)
+                        actions.reverse()
+                        walker.extend(actions)
+                except Exception as event_handler_ex:
+                    sys.stdout = sys.__stdout__
+                    output_handler.add_warning(f"Could not inspect event handler actions: {event_handler_ex}")
+                    sys.stdout = my_stdout
                 continue
             
             try:

@@ -303,6 +303,15 @@ export function isPythonExtensionInstalled(): boolean {
 }
 
 /**
+ * Detects if a VS Code extension that provides the CoreCLR debugger is installed.
+ * @returns true if the .NET debugger is installed, false otherwise
+ */
+export function isDotnetDebuggerExtensionInstalled(): boolean {
+    return !!vscode.extensions.getExtension("ms-dotnettools.csharp") ||
+        !!vscode.extensions.getExtension("ms-dotnettools.csdevkit");
+}
+
+/**
  * Detects if running in Cursor editor
  * @returns true if running in Cursor, false otherwise
  */

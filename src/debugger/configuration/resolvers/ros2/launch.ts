@@ -7,7 +7,6 @@ import * as fsp from "fs/promises";
 import * as yaml from "js-yaml";
 import * as os from "os";
 import * as path from "path";
-import * as readline from "readline";
 import * as shell_quote from "shell-quote";
 import * as tmp from "tmp";
 import * as util from "util";
@@ -32,9 +31,10 @@ interface ILaunchRequest {
     env: { [key: string]: string };
     symbolSearchPath?: string;
     additionalSOLibSearchPath?: string;
-    sourceFileMap?: { [key: string]: string };
+    sourceFileMap?: any;
     launch?: string[];    // Scripts or executables to just launch without attaching a debugger
     attachDebugger?: string[];    // If specified, Scripts or executables to debug; otherwise attaches to everything not ignored
+    noDebug?: boolean;
 }
 
 interface IJsonLaunchData {
@@ -80,6 +80,20 @@ interface IPythonLaunchConfiguration {
     stopOnEntry: boolean;
     justMyCode: boolean;
     pathMappings?: Array<{ localRoot: string; remoteRoot: string; }>;
+}
+
+interface IDotnetLaunchConfiguration {
+    name: string;
+    type: "coreclr";
+    request: "launch";
+    program: string;
+    args: string[];
+    cwd: string;
+    env: { [key: string]: string };
+    stopAtEntry: boolean;
+    justMyCode: boolean;
+    sourceFileMap?: { [key: string]: string };
+    console?: "internalConsole" | "integratedTerminal" | "externalTerminal";
 }
 
 interface ICppvsdbgLaunchConfiguration {
@@ -136,6 +150,10 @@ export interface ILldbLaunchConfiguration {
     reverseDebugging?: boolean;
     stopAtEntry?: boolean;
     pid?: number;
+}
+
+interface IDotnetExecutableInfo {
+    program: string;
 }
 
 
@@ -462,35 +480,51 @@ export class LaunchResolver implements vscode.DebugConfigurationProvider {
         return null;
     }
 
+    private getExecutableNameCandidates(executable: string): string[] {
+        const baseName = path.basename(executable);
+        const ext = path.extname(baseName);
+        const stem = ext ? path.basename(baseName, ext) : baseName;
+        const candidates = new Set<string>([baseName, stem]);
+
+        if (baseName.endsWith(".bin")) {
+            const withoutBin = baseName.substring(0, baseName.length - ".bin".length);
+            candidates.add(withoutBin);
+            const withoutBinExt = path.extname(withoutBin);
+            candidates.add(withoutBinExt ? path.basename(withoutBin, withoutBinExt) : withoutBin);
+        }
+
+        return Array.from(candidates).filter(candidate => candidate.length > 0);
+    }
+
+    private executableListContains(executableList: any, executable: string): boolean {
+        if (!Array.isArray(executableList)) {
+            return false;
+        }
+
+        const configuredNames = new Set(executableList.map(item => item.toString()));
+        return this.getExecutableNameCandidates(executable)
+            .some(candidate => configuredNames.has(candidate));
+    }
+
     private generateLaunchRequest(nodeName: string, command: string, config: requests.ILaunchRequest): ILaunchRequest {
         let parsedArgs: shell_quote.ParseEntry[];
 
         parsedArgs = shell_quote.parse(command);
 
         let executable = parsedArgs.shift().toString();
+        const shouldLaunchWithoutDebugger = this.executableListContains(config.launch, executable);
 
-         // return rviz instead of rviz.exe, or spawner instead of spawner.py
-         // This allows the user to run filter out genericly. 
-        let executableName = path.basename(executable, path.extname(executable));
-
-        // If this executable is just launched, don't attach a debugger.
-        if (config.launch && 
-            config.launch.indexOf(executableName) != -1) {
-          return null;
-        }
-
-        // Filter shell scripts - just launch them
+        // Filter shell scripts - launch them without attaching a debugger
         //  https://github.com/ranchhandrobotics/rde-ros-2/issues/474 
         let executableExt = path.extname(executable);
-        if (executableExt && 
-            ["bash", "sh", "bat", "cmd", "ps1"].includes(executableExt)) {
-          return null;
-        }
+        const isShellScript = !!(executableExt &&
+            ["bash", "sh", "bat", "cmd", "ps1"].includes(executableExt));
 
         // If a specific list of nodes is specified, then determine if this is one of them.
         // If no specific nodes specifed, attach to all unless specifically ignored.
-        if (config.attachDebugger == null ||
-          config.attachDebugger.indexOf(executableName) != -1) {
+        const hasSpecificAttachList = Array.isArray(config.attachDebugger) && config.attachDebugger.length > 0;
+        if (shouldLaunchWithoutDebugger || isShellScript ||
+            !hasSpecificAttachList || this.executableListContains(config.attachDebugger, executable)) {
 
           const envConfig: { [key: string]: string; } = config.env;
 
@@ -507,13 +541,169 @@ export class LaunchResolver implements vscode.DebugConfigurationProvider {
               },
               symbolSearchPath: config.symbolSearchPath, 
               additionalSOLibSearchPath: config.additionalSOLibSearchPath, 
-              sourceFileMap: config.sourceFileMap
+              sourceFileMap: this.normalizeSourceFileMap(config.sourceFileMap),
+              noDebug: shouldLaunchWithoutDebugger || isShellScript
           };
 
           return request;
         }
 
         return null;
+    }
+
+    private async readFilePrefix(filePath: string, maxBytes: number = 64 * 1024): Promise<Buffer> {
+        const handle = await fsp.open(filePath, "r");
+        try {
+            const buffer = Buffer.alloc(maxBytes);
+            const result = await handle.read(buffer, 0, maxBytes, 0);
+            return buffer.slice(0, result.bytesRead);
+        } finally {
+            await handle.close();
+        }
+    }
+
+    private async readFirstLine(filePath: string): Promise<string> {
+        const buffer = await this.readFilePrefix(filePath, 8 * 1024);
+        const newlineIndex = buffer.indexOf(0x0a);
+        const endIndex = newlineIndex === -1 ? buffer.length : newlineIndex;
+        return buffer.toString("utf8", 0, endIndex).replace(/\r$/, "");
+    }
+
+    private async isDotnetAppHost(executable: string): Promise<boolean> {
+        try {
+            const buffer = await this.readFilePrefix(executable, 512 * 1024);
+            const hasCoreClrLoader =
+                buffer.indexOf(Buffer.from("libcoreclr.so")) !== -1 ||
+                buffer.indexOf(Buffer.from("coreclr.dll")) !== -1 ||
+                buffer.indexOf(Buffer.from("libcoreclr.dylib")) !== -1;
+            const hasDotnetAppMetadata =
+                buffer.indexOf(Buffer.from(".runtimeconfig.json")) !== -1 ||
+                buffer.indexOf(Buffer.from(".deps.json")) !== -1 ||
+                buffer.indexOf(Buffer.from("The managed DLL bound to this executable")) !== -1;
+
+            return hasCoreClrLoader && hasDotnetAppMetadata;
+        } catch {
+            return false;
+        }
+    }
+
+    private extractDotnetProgramFromWrapper(wrapperPath: string, wrapperContent: string): string | undefined {
+        const dirnameExecMatch = wrapperContent.match(/exec\s+["']?\$\(dirname\s+["']?\$0["']?\)\/([^"'\s]+)["']?/);
+        if (dirnameExecMatch && dirnameExecMatch[1]) {
+            return path.join(path.dirname(wrapperPath), dirnameExecMatch[1]);
+        }
+
+        const baseName = path.basename(wrapperPath);
+        const siblingBin = path.join(path.dirname(wrapperPath), `${baseName}.bin`);
+        if (fs.existsSync(siblingBin)) {
+            return siblingBin;
+        }
+
+        return undefined;
+    }
+
+    private async resolveDotnetExecutableInfo(executable: string): Promise<IDotnetExecutableInfo | undefined> {
+        if (await this.isDotnetAppHost(executable)) {
+            return { program: executable };
+        }
+
+        let firstLine: string;
+        try {
+            firstLine = await this.readFirstLine(executable);
+        } catch {
+            return undefined;
+        }
+
+        const isShellWrapper = firstLine.startsWith("#!") &&
+            /\b(?:bash|sh|zsh|dash)\b/.test(firstLine.toLowerCase());
+        if (!isShellWrapper) {
+            return undefined;
+        }
+
+        const wrapperContent = (await this.readFilePrefix(executable, 64 * 1024)).toString("utf8");
+        const dotnetProgram = this.extractDotnetProgramFromWrapper(executable, wrapperContent);
+        if (!dotnetProgram) {
+            return undefined;
+        }
+
+        try {
+            await fsp.access(dotnetProgram, fs.constants.X_OK | fs.constants.R_OK);
+        } catch {
+            return undefined;
+        }
+
+        if (!await this.isDotnetAppHost(dotnetProgram)) {
+            return undefined;
+        }
+
+        return {
+            program: dotnetProgram
+        };
+    }
+
+    private normalizeSourceFileMap(sourceFileMap: any): { [key: string]: string } | undefined {
+        if (!sourceFileMap) {
+            return undefined;
+        }
+
+        if (typeof sourceFileMap === "string") {
+            const trimmed = sourceFileMap.trim();
+            if (!trimmed) {
+                return undefined;
+            }
+
+            try {
+                return JSON.parse(trimmed);
+            } catch (error) {
+                extension.outputChannel.appendLine(`Failed to parse sourceFileMap as JSON: ${error.message}`);
+                return undefined;
+            }
+        }
+
+        if (typeof sourceFileMap === "object" && !Array.isArray(sourceFileMap)) {
+            return sourceFileMap;
+        }
+
+        return undefined;
+    }
+
+    private withDotnetWrapperEnvironment(baseEnv: { [key: string]: string }): { [key: string]: string } {
+        const env = { ...baseEnv };
+        const rosLibraryPaths: string[] = [];
+
+        if (env.CONDA_PREFIX) {
+            const condaLibPath = path.join(env.CONDA_PREFIX, "lib");
+            if (fs.existsSync(condaLibPath)) {
+                rosLibraryPaths.push(condaLibPath);
+            }
+        }
+
+        if (env.AMENT_PREFIX_PATH) {
+            for (const prefix of env.AMENT_PREFIX_PATH.split(path.delimiter)) {
+                if (!prefix) {
+                    continue;
+                }
+
+                const prefixLibPath = path.join(prefix, "lib");
+                if (fs.existsSync(prefixLibPath)) {
+                    rosLibraryPaths.push(prefixLibPath);
+                }
+            }
+        }
+
+        if (rosLibraryPaths.length > 0) {
+            const uniquePaths = Array.from(new Set(rosLibraryPaths));
+            env.LD_LIBRARY_PATH = [
+                ...uniquePaths,
+                ...(env.LD_LIBRARY_PATH ? [env.LD_LIBRARY_PATH] : [])
+            ].join(path.delimiter);
+            env.DYLD_LIBRARY_PATH = [
+                ...uniquePaths,
+                ...(env.DYLD_LIBRARY_PATH ? [env.DYLD_LIBRARY_PATH] : [])
+            ].join(path.delimiter);
+        }
+
+        return env;
     }
 
     private createPythonLaunchConfig(request: ILaunchRequest, stopOnEntry: boolean): IPythonLaunchConfiguration {
@@ -554,6 +744,62 @@ export class LaunchResolver implements vscode.DebugConfigurationProvider {
         };
         
         return pythonLaunchConfig;
+    }
+
+    private createDotnetLaunchConfig(request: ILaunchRequest, stopOnEntry: boolean): IDotnetLaunchConfiguration {
+        if (!vscode_utils.isDotnetDebuggerExtensionInstalled()) {
+            const message = ".NET debugging requires the Microsoft C# extension (ms-dotnettools.csharp) or C# Dev Kit.";
+            vscode.window.showErrorMessage(message);
+            throw new Error(message);
+        }
+
+        const dotnetLaunchConfig: IDotnetLaunchConfiguration = {
+            name: request.nodeName,
+            type: "coreclr",
+            request: "launch",
+            program: request.executable,
+            args: request.arguments,
+            cwd: request.cwd || ".",
+            env: this.withDotnetWrapperEnvironment(request.env),
+            // ROS launch-level stopOnEntry is useful for native nodes, but CoreCLR
+            // treats it as an entry break even when the user has no breakpoint.
+            stopAtEntry: false,
+            justMyCode: false,
+            console: "internalConsole"
+        };
+
+        const sourceFileMap = this.normalizeSourceFileMap(request.sourceFileMap);
+        if (sourceFileMap) {
+            dotnetLaunchConfig.sourceFileMap = sourceFileMap;
+        }
+
+        return dotnetLaunchConfig;
+    }
+
+    private async executeProcessOnlyRequest(request: ILaunchRequest): Promise<void> {
+        extension.outputChannel.appendLine(`Launching without debugger: ${request.executable} ${request.arguments.join(" ")}`);
+
+        await fsp.access(request.executable, fs.constants.X_OK | fs.constants.R_OK);
+
+        const child = child_process.spawn(
+            request.executable,
+            request.arguments,
+            {
+                cwd: request.cwd || ".",
+                env: request.env,
+                windowsHide: true,
+            }
+        );
+
+        child.stdout?.on("data", data => {
+            extension.outputChannel.append(data.toString());
+        });
+        child.stderr?.on("data", data => {
+            extension.outputChannel.append(data.toString());
+        });
+        child.on("error", error => {
+            extension.outputChannel.appendLine(`Failed to launch ${request.executable}: ${error.message}`);
+        });
     }
 
     private createCppLaunchConfig(request: ILaunchRequest, stopOnEntry: boolean): ICppvsdbgLaunchConfiguration | ICppdbgLaunchConfiguration | ILldbLaunchConfiguration {
@@ -636,7 +882,12 @@ export class LaunchResolver implements vscode.DebugConfigurationProvider {
     }
 
     private async executeLaunchRequest(request: ILaunchRequest, stopOnEntry: boolean) {
-        let debugConfig: ICppvsdbgLaunchConfiguration | ICppdbgLaunchConfiguration | IPythonLaunchConfiguration | ILldbLaunchConfiguration;
+        let debugConfig: ICppvsdbgLaunchConfiguration | ICppdbgLaunchConfiguration | IPythonLaunchConfiguration | IDotnetLaunchConfiguration | ILldbLaunchConfiguration;
+
+        if (request.noDebug) {
+            await this.executeProcessOnlyRequest(request);
+            return;
+        }
 
         if (os.platform() === "win32") {
             let nodePath = path.parse(request.executable);
@@ -661,12 +912,16 @@ export class LaunchResolver implements vscode.DebugConfigurationProvider {
                 } catch {
                     // The python file is not available then this must be...
 
-                    // C#? Todo
+                    const dotnetInfo = await this.resolveDotnetExecutableInfo(request.executable);
+                    if (dotnetInfo) {
+                        request.executable = dotnetInfo.program;
+                        debugConfig = this.createDotnetLaunchConfig(request, stopOnEntry);
+                    } else {
+                        // Rust? Todo
 
-                    // Rust? Todo
-
-                    // C++
-                    debugConfig = this.createCppLaunchConfig(request, stopOnEntry);
+                        // C++
+                        debugConfig = this.createCppLaunchConfig(request, stopOnEntry);
+                    }
                 }
             } else if (nodePath.ext.toLowerCase() === ".py") {
                 debugConfig = this.createPythonLaunchConfig(request, stopOnEntry);
@@ -683,38 +938,28 @@ export class LaunchResolver implements vscode.DebugConfigurationProvider {
             // this should be guaranteed by roslaunch
             await fsp.access(request.executable, fs.constants.X_OK | fs.constants.R_OK);
 
-            const fileStream = fs.createReadStream(request.executable);
-            const rl = readline.createInterface({
-                input: fileStream,
-                crlfDelay: Infinity,
-            });
-
-            // we only want to read 1 line to check for shebang line
-            let linesToRead: number = 1;
-            rl.on("line", async (line) => {
-                if (linesToRead <= 0) {
-                    return;
-                }
-                linesToRead--;
-                if (!linesToRead) {
-                    rl.close();
-                }
+            const dotnetInfo = await this.resolveDotnetExecutableInfo(request.executable);
+            if (dotnetInfo) {
+                request.executable = dotnetInfo.program;
+                debugConfig = this.createDotnetLaunchConfig(request, stopOnEntry);
+            } else {
+                const firstLine = await this.readFirstLine(request.executable);
 
                 // look for Python in shebang line
-                if (line.startsWith("#!") && line.toLowerCase().indexOf("python") !== -1) {
+                if (firstLine.startsWith("#!") && firstLine.toLowerCase().indexOf("python") !== -1) {
                     debugConfig = this.createPythonLaunchConfig(request, stopOnEntry);
                 } else {
                     debugConfig = this.createCppLaunchConfig(request, stopOnEntry);
                 }
+            }
 
-                if (!debugConfig) {
-                    throw (new Error(`Failed to create a debug configuration!`));
-                }
-                const launched = await vscode.debug.startDebugging(undefined, debugConfig);
-                if (!launched) {
-                    throw (new Error(`Failed to start debug session!`));
-                }
-            });
+            if (!debugConfig) {
+                throw (new Error(`Failed to create a debug configuration!`));
+            }
+            const launched = await vscode.debug.startDebugging(undefined, debugConfig);
+            if (!launched) {
+                throw (new Error(`Failed to start debug session!`));
+            }
         }
     }
 

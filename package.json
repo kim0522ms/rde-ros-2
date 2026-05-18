@@ -356,7 +356,8 @@
                 "runtime": "node",
                 "languages": [
                     "cpp",
-                    "python"
+                    "python",
+                    "csharp"
                 ],
                 "configurationAttributes": {
                     "launch": {
@@ -398,8 +399,18 @@
                                 "default": ""
                             },
                             "sourceFileMap": {
-                                "type": "string",
-                                "description": "Optional source file mappings passed to the debug engine. Example: '{ \"/original/source/path\":\"/current/source/path\" }'",
+                                "anyOf": [
+                                    {
+                                        "type": "string"
+                                    },
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "string"
+                                        }
+                                    }
+                                ],
+                                "description": "Optional source file mappings passed to the debug engine. Supports a JSON object or a JSON object encoded as a string. Example: { \"/original/source/path\":\"/current/source/path\" }",
                                 "default": ""
                             },
                             "launch": {
@@ -448,11 +459,12 @@
                         "properties": {
                             "runtime": {
                                 "type": "string",
-                                "description": "Runtime type of the node (currently supports Python and C++). Use \"${action:pick}\" to choose interactively.\nThis is only for local processes that were launched directly. Advanced attaching (e.g. attaching to a running ptvsd server, attaching to a remote process, etc.) should use language-specific debugger extension.",
+                                "description": "Runtime type of the node (supports Python, C++, and .NET). Use \"${action:pick}\" to choose interactively.\nThis is only for local processes that were launched directly. Advanced attaching (e.g. attaching to a running ptvsd server, attaching to a remote process, etc.) should use language-specific debugger extension.",
                                 "enum": [
                                     "${action:pick}",
                                     "C++",
-                                    "Python"
+                                    "Python",
+                                    ".NET"
                                 ],
                                 "default": "${action:pick}"
                             },
